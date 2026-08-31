@@ -1,11 +1,15 @@
-const express = require('express');
-const cors = require('cors');
-const mysql = require('mysql2');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
+import express, { Request, Response, NextFunction } from 'express';
+import cors from 'cors';
+import mysql from 'mysql2';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+
+export interface CustomRequest extends Request {
+    utente?: any;
+}
 
 const app = express();
 const PORT = 5000;
@@ -37,7 +41,7 @@ const db = mysql.createConnection({
     password: ''     
 });
 
-// --- NUOVA CONNESSIONE CON AUTO-CREAZIONE TABELLE ---
+// Connessione con auto-creazione tabelle
 db.connect((err) => {
     if (err) {
         console.error("Errore di connessione a MySQL:", err);
@@ -64,14 +68,17 @@ db.connect((err) => {
                 FOREIGN KEY (utente_id) REFERENCES utenti(id) ON DELETE CASCADE
             )`;
             
+            // visto è ora un DATETIME
             const queryFilm = `CREATE TABLE IF NOT EXISTS film (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 testo VARCHAR(255) NOT NULL,
                 copertina VARCHAR(255),
-                visto BOOLEAN DEFAULT FALSE,
+                visto DATETIME DEFAULT NULL,
                 rating INT DEFAULT 0,
                 utente_id INT NOT NULL,
                 lista_id INT,
+                durata INT DEFAULT 0,
+                genere VARCHAR(255) DEFAULT 'Non specificato',
                 FOREIGN KEY (utente_id) REFERENCES utenti(id) ON DELETE CASCADE,
                 FOREIGN KEY (lista_id) REFERENCES liste(id) ON DELETE SET NULL
             )`;
@@ -98,7 +105,6 @@ db.connect((err) => {
                 FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
             )`;
 
-            // Eseguiamo le query in sequenza per rispettare le dipendenze delle chiavi esterne
             db.query(queryUtenti, () => {
                 db.query(queryListe, () => {
                     db.query(queryFilm, () => {
@@ -115,9 +121,8 @@ db.connect((err) => {
         });
     });
 });
-// ----------------------------------------------------
 
-const autenticaToken = (req, res, next) => {
+const autenticaToken = (req: CustomRequest, res: Response, next: NextFunction): any => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1]; 
 
@@ -130,21 +135,20 @@ const autenticaToken = (req, res, next) => {
     });
 };
 
-// --- ROTTE UTENTI ---
-app.post('/api/register', async (req, res) => {
+//  ROTTE UTENTI 
+app.post('/api/register', async (req: Request, res: Response): Promise<any> => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ errore: "Campi incompleti" });
     try {
         const salt = await bcrypt.genSalt(10);
         const passwordCriptata = await bcrypt.hash(password, salt);
         
-        db.query("INSERT INTO utenti (email, password) VALUES (?, ?)", [email, passwordCriptata], async (err, result) => {
+        db.query("INSERT INTO utenti (email, password) VALUES (?, ?)", [email, passwordCriptata], async (err: any, result: any) => {
             if (err) {
                 if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ errore: "Questa email esiste già!" });
                 return res.status(500).json({ errore: err.message });
             }
             
-            // CREIAMO LA LISTA DI DEFAULT PER IL NUOVO UTENTE
             const nuovoUtenteId = result.insertId;
             await db.promise().query(
                 "INSERT INTO liste (nome, utente_id, is_default) VALUES (?, ?, TRUE)", 
@@ -158,9 +162,9 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', (req: Request, res: Response) => {
     const { email, password } = req.body;
-    db.query("SELECT * FROM utenti WHERE email = ?", [email], async (err, results) => {
+    db.query("SELECT * FROM utenti WHERE email = ?", [email], async (err, results: any) => {
         if (err) return res.status(500).json({ errore: err.message });
         if (results.length === 0) return res.status(400).json({ errore: "Utente non trovato" });
 
@@ -169,18 +173,15 @@ app.post('/api/login', (req, res) => {
             const passwordCorretta = await bcrypt.compare(password, utenteUtile.password);
             if (!passwordCorretta) return res.status(400).json({ errore: "Password errata" });
 
-            // --- CONTROLLO RETROCOMPATIBILITÀ (Crea lista default ai vecchi utenti) ---
-            const [liste] = await db.promise().query("SELECT id FROM liste WHERE utente_id = ? AND is_default = TRUE", [utenteUtile.id]);
+            const [liste]: any = await db.promise().query("SELECT id FROM liste WHERE utente_id = ? AND is_default = TRUE", [utenteUtile.id]);
             let defaultListId;
             if (liste.length === 0) {
-                const [nuovaLista] = await db.promise().query("INSERT INTO liste (nome, utente_id, is_default) VALUES (?, ?, TRUE)", ["Generale", utenteUtile.id]);
+                const [nuovaLista]: any = await db.promise().query("INSERT INTO liste (nome, utente_id, is_default) VALUES (?, ?, TRUE)", ["Generale", utenteUtile.id]);
                 defaultListId = nuovaLista.insertId;
             } else {
                 defaultListId = liste[0].id;
             }
-            // Aggiorna i vecchi film senza cartella inserendoli in Generale
             await db.promise().query("UPDATE film SET lista_id = ? WHERE utente_id = ? AND lista_id IS NULL", [defaultListId, utenteUtile.id]);
-            // --------------------------------------------------------------------------
 
             const token = jwt.sign({ id: utenteUtile.id, email: utenteUtile.email }, JWT_SECRET, { expiresIn: '365d' });
             return res.json({ token });
@@ -190,70 +191,71 @@ app.post('/api/login', (req, res) => {
     });
 });
 
-// --- ROTTE LISTE ---
-app.get('/api/liste', autenticaToken, (req, res) => {
+// ROTTE LISTE 
+app.get('/api/liste', autenticaToken, (req: CustomRequest, res: Response) => {
     db.query("SELECT * FROM liste WHERE utente_id = ?", [req.utente.id], (err, results) => {
         if (err) return res.status(500).json({ errore: err.message });
         res.json(results);
     });
 });
 
-app.post('/api/liste', autenticaToken, (req, res) => {
+app.post('/api/liste', autenticaToken, (req: CustomRequest, res: Response): any => {
     const { nome } = req.body;
     if (!nome) return res.status(400).json({ errore: "Il nome della lista è obbligatorio" });
-    db.query("INSERT INTO liste (nome, utente_id, is_default) VALUES (?, ?, FALSE)", [nome, req.utente.id], (err, result) => {
+    db.query("INSERT INTO liste (nome, utente_id, is_default) VALUES (?, ?, FALSE)", [nome, req.utente.id], (err, result: any) => {
         if (err) return res.status(500).json({ errore: err.message });
         res.status(201).json({ message: "Lista creata", id: result.insertId });
     });
 });
 
-app.put('/api/liste/:id', autenticaToken, async (req, res) => {
+app.put('/api/liste/:id', autenticaToken, async (req: CustomRequest, res: Response): Promise<any> => {
     const { nome } = req.body;
     const listaId = req.params.id;
     try {
-        const [lista] = await db.promise().query("SELECT is_default FROM liste WHERE id = ? AND utente_id = ?", [listaId, req.utente.id]);
+        const [lista]: any = await db.promise().query("SELECT is_default FROM liste WHERE id = ? AND utente_id = ?", [listaId, req.utente.id]);
         if (lista.length === 0) return res.status(404).json({ errore: "Lista non trovata" });
         if (lista[0].is_default) return res.status(403).json({ errore: "Non puoi rinominare la lista Generale" });
 
         await db.promise().query("UPDATE liste SET nome = ? WHERE id = ? AND utente_id = ?", [nome, listaId, req.utente.id]);
         res.json({ message: "Lista rinominata con successo" });
-    } catch (err) {
+    } catch (err: any) {
         res.status(500).json({ errore: err.message });
     }
 });
 
-app.delete('/api/liste/:id', autenticaToken, async (req, res) => {
+app.delete('/api/liste/:id', autenticaToken, async (req: CustomRequest, res: Response): Promise<any> => {
     const listaId = req.params.id;
     try {
-        const [lista] = await db.promise().query("SELECT is_default FROM liste WHERE id = ? AND utente_id = ?", [listaId, req.utente.id]);
+        const [lista]: any = await db.promise().query("SELECT is_default FROM liste WHERE id = ? AND utente_id = ?", [listaId, req.utente.id]);
         if (lista.length === 0) return res.status(404).json({ errore: "Lista non trovata" });
         if (lista[0].is_default) return res.status(403).json({ errore: "Non puoi eliminare la lista Generale" });
 
-        const [defaultList] = await db.promise().query("SELECT id FROM liste WHERE utente_id = ? AND is_default = TRUE", [req.utente.id]);
+        const [defaultList]: any = await db.promise().query("SELECT id FROM liste WHERE utente_id = ? AND is_default = TRUE", [req.utente.id]);
         
-        // Travasiamo i film nella lista generale
         await db.promise().query("UPDATE film SET lista_id = ? WHERE lista_id = ? AND utente_id = ?", [defaultList[0].id, listaId, req.utente.id]);
-        // Eliminiamo la lista vuota
         await db.promise().query("DELETE FROM liste WHERE id = ? AND utente_id = ?", [listaId, req.utente.id]);
 
         res.json({ message: "Lista eliminata e film spostati in Generale" });
-    } catch (err) {
+    } catch (err: any) {
         res.status(500).json({ errore: err.message });
     }
 });
 
-// --- ROTTE FILM ---
-app.get('/api/film', autenticaToken, (req, res) => {
+// ROTTE FILM 
+app.get('/api/film', autenticaToken, (req: CustomRequest, res: Response) => {
     db.query("SELECT * FROM film WHERE utente_id = ?", [req.utente.id], (err, results) => {
         if (err) return res.status(500).json({ errore: err.message });
         res.json(results);
     });
 });
 
-app.post('/api/film', autenticaToken, upload.single('copertina'), async (req, res) => {
+app.post('/api/film', autenticaToken, upload.single('copertina'), async (req: CustomRequest, res: Response): Promise<any> => {
     const nuovoTitolo = req.body.testo;
     let urlImmagine = null;
     let listaIdTarget = req.body.lista_id; 
+    
+    const durata = req.body.durata || 0;
+    const genere = req.body.genere || 'Non specificato';
 
     if (req.file) urlImmagine = `http://localhost:5000/uploads/${req.file.filename}`;
     else if (req.body.copertina) urlImmagine = req.body.copertina;
@@ -261,25 +263,24 @@ app.post('/api/film', autenticaToken, upload.single('copertina'), async (req, re
     if (!nuovoTitolo) return res.status(400).json({ errore: "Il titolo non può essere vuoto" });
 
     try {
-        // Se non viene specificata una lista, lo mettiamo nella lista Generale
         if (!listaIdTarget || listaIdTarget === 'null' || listaIdTarget === 'undefined') {
-            const [defaultList] = await db.promise().query("SELECT id FROM liste WHERE utente_id = ? AND is_default = TRUE", [req.utente.id]);
+            const [defaultList]: any = await db.promise().query("SELECT id FROM liste WHERE utente_id = ? AND is_default = TRUE", [req.utente.id]);
             listaIdTarget = defaultList[0].id;
         }
 
         await db.promise().query(
-            "INSERT INTO film (testo, copertina, utente_id, lista_id) VALUES (?, ?, ?, ?)", 
-            [nuovoTitolo, urlImmagine, req.utente.id, listaIdTarget]
+            "INSERT INTO film (testo, copertina, utente_id, lista_id, durata, genere) VALUES (?, ?, ?, ?, ?, ?)", 
+            [nuovoTitolo, urlImmagine, req.utente.id, listaIdTarget, durata, genere]
         );
 
         const [results] = await db.promise().query("SELECT * FROM film WHERE utente_id = ?", [req.utente.id]);
         res.json(results);
-    } catch (err) {
+    } catch (err: any) {
         res.status(500).json({ errore: err.message });
     }
 });
 
-app.put('/api/film/:id', autenticaToken, (req, res) => {
+app.put('/api/film/:id', autenticaToken, (req: CustomRequest, res: Response) => {
     const idDaModificare = req.params.id;
     const { testo, lista_id } = req.body; 
 
@@ -303,10 +304,16 @@ app.put('/api/film/:id', autenticaToken, (req, res) => {
     });
 });
 
-app.patch('/api/film/:id/visto', autenticaToken, (req, res) => {
+//  Salvataggio Data (NOW()) o NULL
+app.patch('/api/film/:id/visto', autenticaToken, (req: CustomRequest, res: Response) => {
     const idDaModificare = req.params.id;
-    const nuovoStato = req.body.visto; 
-    db.query("UPDATE film SET visto = ? WHERE id = ? AND utente_id = ?", [nuovoStato, idDaModificare, req.utente.id], (err, result) => {
+    const setVisto = req.body.visto; // Il frontend invierà true o false
+    
+    const query = setVisto 
+        ? "UPDATE film SET visto = NOW() WHERE id = ? AND utente_id = ?" 
+        : "UPDATE film SET visto = NULL WHERE id = ? AND utente_id = ?";
+
+    db.query(query, [idDaModificare, req.utente.id], (err, result) => {
         if (err) return res.status(500).json({ errore: err.message });
         db.query("SELECT * FROM film WHERE utente_id = ?", [req.utente.id], (err, results) => {
             if (err) return res.status(500).json({ errore: err.message });
@@ -315,7 +322,7 @@ app.patch('/api/film/:id/visto', autenticaToken, (req, res) => {
     });
 });
 
-app.patch('/api/film/:id/rating', autenticaToken, (req, res) => {
+app.patch('/api/film/:id/rating', autenticaToken, (req: CustomRequest, res: Response) => {
     const idDaModificare = req.params.id;
     const nuovoVoto = req.body.rating; 
     db.query("UPDATE film SET rating = ? WHERE id = ? AND utente_id = ?", [nuovoVoto, idDaModificare, req.utente.id], (err, result) => {
@@ -327,7 +334,7 @@ app.patch('/api/film/:id/rating', autenticaToken, (req, res) => {
     });
 });
 
-app.delete('/api/film/:id', autenticaToken, (req, res) => {
+app.delete('/api/film/:id', autenticaToken, (req: CustomRequest, res: Response) => {
     const idDaEliminare = req.params.id;
     db.query("DELETE FROM film WHERE id = ? AND utente_id = ?", [idDaEliminare, req.utente.id], (err, result) => {
         if (err) return res.status(500).json({ errore: err.message });
@@ -339,10 +346,10 @@ app.delete('/api/film/:id', autenticaToken, (req, res) => {
 });
 
 
-// --- ROTTE ATTORI ---
-app.get('/api/film/:filmId/attori', autenticaToken, (req, res) => {
+//  ROTTE ATTORI 
+app.get('/api/film/:filmId/attori', autenticaToken, (req: CustomRequest, res: Response): any => {
     const filmId = req.params.filmId;
-    db.query("SELECT * FROM film WHERE id = ? AND utente_id = ?", [filmId, req.utente.id], (err, results) => {
+    db.query("SELECT * FROM film WHERE id = ? AND utente_id = ?", [filmId, req.utente.id], (err, results: any) => {
         if (err) return res.status(500).json({ errore: err.message });
         if (results.length === 0) return res.status(403).json({ errore: "Accesso negato" });
         db.query("SELECT * FROM attori WHERE film_id = ?", [filmId], (err, attori) => {
@@ -352,10 +359,10 @@ app.get('/api/film/:filmId/attori', autenticaToken, (req, res) => {
     });
 });
 
-app.post('/api/film/:filmId/attori', autenticaToken, (req, res) => {
+app.post('/api/film/:filmId/attori', autenticaToken, (req: CustomRequest, res: Response): any => {
     const filmId = req.params.filmId;
     const { nome_cognome, ruolo } = req.body; 
-    db.query("SELECT * FROM film WHERE id = ? AND utente_id = ?", [filmId, req.utente.id], (err, results) => {
+    db.query("SELECT * FROM film WHERE id = ? AND utente_id = ?", [filmId, req.utente.id], (err, results: any) => {
         if (err) return res.status(500).json({ errore: err.message });
         if (results.length === 0) return res.status(403).json({ errore: "Accesso negato" });
         db.query("INSERT INTO attori (nome_cognome, ruolo, film_id) VALUES (?, ?, ?)", [nome_cognome, ruolo || null, filmId], (err, result) => {
@@ -366,18 +373,18 @@ app.post('/api/film/:filmId/attori', autenticaToken, (req, res) => {
 });
 
 
-// --- ROTTE TAG ---
-app.get('/api/film/:id/tags', autenticaToken, async (req, res) => {
+// ROTTE TAG 
+app.get('/api/film/:id/tags', autenticaToken, async (req: CustomRequest, res: Response): Promise<any> => {
     const filmId = req.params.id;
     try {
-        const [checkFilm] = await db.promise().query("SELECT id FROM film WHERE id = ? AND utente_id = ?", [filmId, req.utente.id]);
+        const [checkFilm]: any = await db.promise().query("SELECT id FROM film WHERE id = ? AND utente_id = ?", [filmId, req.utente.id]);
         if (checkFilm.length === 0) return res.status(403).json({ error: "Accesso negato al film" });
 
         const [tags] = await db.promise().query(
             `SELECT t.id, t.nome, t.colore 
              FROM tags t
-             JOIN film_tags ft ON t.id = ft.tag_id
-             WHERE ft.film_id = ?`, 
+             JOIN film_tags ON t.id = film_tags.tag_id
+             WHERE film_tags.film_id = ?`, 
             [filmId]
         );
         res.json(tags);
@@ -387,7 +394,7 @@ app.get('/api/film/:id/tags', autenticaToken, async (req, res) => {
     }
 });
 
-app.post('/api/film/:id/tags', autenticaToken, async (req, res) => {
+app.post('/api/film/:id/tags', autenticaToken, async (req: CustomRequest, res: Response): Promise<any> => {
     const filmId = req.params.id;
     const { nome_tag, colore } = req.body; 
 
@@ -396,12 +403,10 @@ app.post('/api/film/:id/tags', autenticaToken, async (req, res) => {
     }
 
     try {
-        const [checkFilm] = await db.promise().query("SELECT id FROM film WHERE id = ? AND utente_id = ?", [filmId, req.utente.id]);
+        const [checkFilm]: any = await db.promise().query("SELECT id FROM film WHERE id = ? AND utente_id = ?", [filmId, req.utente.id]);
         if (checkFilm.length === 0) return res.status(403).json({ error: "Accesso negato al film" });
 
-        const [tagEsistente] = await db.promise().query(
-            "SELECT id FROM tags WHERE nome = ?", [nome_tag]
-        );
+        const [tagEsistente]: any = await db.promise().query("SELECT id FROM tags WHERE nome = ?", [nome_tag]);
 
         let tagId;
 
@@ -409,17 +414,14 @@ app.post('/api/film/:id/tags', autenticaToken, async (req, res) => {
             tagId = tagEsistente[0].id;
         } else {
             const coloreTag = colore || '#3b82f6'; 
-            const [nuovoTag] = await db.promise().query(
+            const [nuovoTag]: any = await db.promise().query(
                 "INSERT INTO tags (nome, colore) VALUES (?, ?)", 
                 [nome_tag, coloreTag]
             );
             tagId = nuovoTag.insertId;
         }
 
-        await db.promise().query(
-            "INSERT IGNORE INTO film_tags (film_id, tag_id) VALUES (?, ?)",
-            [filmId, tagId]
-        );
+        await db.promise().query("INSERT IGNORE INTO film_tags (film_id, tag_id) VALUES (?, ?)", [filmId, tagId]);
 
         res.status(201).json({ message: "Tag salvato e associato con successo!", tag_id: tagId });
     } catch (err) {
@@ -428,19 +430,15 @@ app.post('/api/film/:id/tags', autenticaToken, async (req, res) => {
     }
 });
 
-app.delete('/api/film/:filmId/tags/:tagId', autenticaToken, async (req, res) => {
+app.delete('/api/film/:filmId/tags/:tagId', autenticaToken, async (req: CustomRequest, res: Response): Promise<any> => {
     const filmId = req.params.filmId;
     const tagId = req.params.tagId;
 
     try {
-        const [checkFilm] = await db.promise().query("SELECT id FROM film WHERE id = ? AND utente_id = ?", [filmId, req.utente.id]);
+        const [checkFilm]: any = await db.promise().query("SELECT id FROM film WHERE id = ? AND utente_id = ?", [filmId, req.utente.id]);
         if (checkFilm.length === 0) return res.status(403).json({ error: "Accesso negato al film" });
 
-        await db.promise().query(
-            "DELETE FROM film_tags WHERE film_id = ? AND tag_id = ?",
-            [filmId, tagId]
-        );
-
+        await db.promise().query("DELETE FROM film_tags WHERE film_id = ? AND tag_id = ?", [filmId, tagId]);
         res.json({ message: "Tag rimosso dal film con successo!" });
     } catch (err) {
         console.error("Errore rimozione tag:", err);
@@ -448,20 +446,73 @@ app.delete('/api/film/:filmId/tags/:tagId', autenticaToken, async (req, res) => 
     }
 });
 
-// --- EXPORT JSON ---
-app.get('/api/export', autenticaToken, async (req, res) => {
+
+//  ROTTA STATISTICHE 
+app.get('/api/statistiche', autenticaToken, async (req: CustomRequest, res: Response) => {
+    const utenteId = req.utente.id;
+
     try {
-        // 1. Prendiamo tutte le liste dell'utente loggato
+        // Calcola i totali base (ora controlliamo IS NOT NULL per la data)
+        const [statsBase]: any = await db.promise().query(`
+            SELECT 
+                COUNT(*) AS totale_film,
+                SUM(CASE WHEN visto IS NOT NULL THEN 1 ELSE 0 END) AS film_visti,
+                SUM(CASE WHEN visto IS NULL THEN 1 ELSE 0 END) AS film_da_vedere,
+                SUM(CASE WHEN visto IS NOT NULL THEN durata ELSE 0 END) AS minuti_totali_visti
+            FROM film
+            WHERE utente_id = ?
+        `, [utenteId]);
+
+        // Calcola i minuti per genere
+        const [statsGeneri]: any = await db.promise().query(`
+            SELECT 
+                genere, 
+                SUM(durata) AS minuti_visti 
+            FROM film
+            WHERE visto IS NOT NULL AND utente_id = ?
+            GROUP BY genere
+            ORDER BY minuti_visti DESC
+        `, [utenteId]);
+
+        // Conta le liste create dall'utente
+        const [statsListe]: any = await db.promise().query(`
+            SELECT COUNT(*) AS totale_liste FROM liste WHERE utente_id = ?
+        `, [utenteId]);
+
+        //  Prendi gli ultimi 3 film visti (ordinati per data decrescente)
+        const [ultimiVisti]: any = await db.promise().query(`
+            SELECT id, testo, copertina, visto, durata, genere, rating
+            FROM film 
+            WHERE utente_id = ? AND visto IS NOT NULL 
+            ORDER BY visto DESC 
+            LIMIT 3
+        `, [utenteId]);
+
+        res.json({
+            totali: {
+                ...statsBase[0],
+                totale_liste: statsListe[0].totale_liste
+            },
+            perGenere: statsGeneri,
+            ultimiVisti: ultimiVisti
+        });
+    } catch (err: any) {
+        console.error("Errore nel calcolo delle statistiche:", err);
+        res.status(500).json({ errore: "Errore interno del server" });
+    }
+});
+
+
+//  EXPORT/IMPORT JSON 
+app.get('/api/export', autenticaToken, async (req: CustomRequest, res: Response) => {
+    try {
         const [liste] = await db.promise().query("SELECT nome, is_default FROM liste WHERE utente_id = ?", [req.utente.id]);
-        // 2. Prendiamo tutti i film e associamo il NOME della loro lista
         const [film] = await db.promise().query(`
-            SELECT f.testo, f.copertina, f.visto, f.rating, l.nome as lista_nome
+            SELECT f.testo, f.copertina, f.visto, f.rating, f.durata, f.genere, l.nome as lista_nome
             FROM film f
             LEFT JOIN liste l ON f.lista_id = l.id
             WHERE f.utente_id = ?
         `, [req.utente.id]);
-        
-        // Inviamo il pacchetto JSON completo
         res.json({ liste, film });
     } catch (err) {
         console.error(err);
@@ -469,49 +520,47 @@ app.get('/api/export', autenticaToken, async (req, res) => {
     }
 });
 
-// --- IMPORT JSON ---
-app.post('/api/import', autenticaToken, async (req, res) => {
+app.post('/api/import', autenticaToken, async (req: CustomRequest, res: Response): Promise<any> => {
     const { liste, film } = req.body;
     if (!liste || !film) return res.status(400).json({ error: "Formato JSON non valido." });
 
     try {
-        // Inizia la transazione (così se c'è un errore, annulla tutto senza rompere il DB)
         await db.promise().beginTransaction();
 
-        // 1. Elimina i film e le liste attuali dell'UTENTE LOGGATO (tranne la lista Generale di default)
         await db.promise().query("DELETE FROM film WHERE utente_id = ?", [req.utente.id]);
         await db.promise().query("DELETE FROM liste WHERE utente_id = ? AND is_default = FALSE", [req.utente.id]);
 
-        // 2. Ricrea le liste dal JSON
         for (const l of liste) {
             if (!l.is_default) {
                 await db.promise().query("INSERT IGNORE INTO liste (nome, utente_id, is_default) VALUES (?, ?, FALSE)", [l.nome, req.utente.id]);
             }
         }
 
-        // 3. Riprendiamo i nuovi ID delle liste appena create (per mapparli correttamente)
-        const [listeAttuali] = await db.promise().query("SELECT id, nome, is_default FROM liste WHERE utente_id = ?", [req.utente.id]);
-        const mappaListe = {};
+        const [listeAttuali]: any = await db.promise().query("SELECT id, nome, is_default FROM liste WHERE utente_id = ?", [req.utente.id]);
+        const mappaListe: any = {};
         let defaultListId = null;
-        listeAttuali.forEach(l => {
+        listeAttuali.forEach((l: any) => {
             mappaListe[l.nome] = l.id;
             if (l.is_default) defaultListId = l.id;
         });
 
-        // 4. Inseriamo tutti i film, riassegnandoli alla lista corretta
         for (const f of film) {
             const lista_id = mappaListe[f.lista_nome] || defaultListId;
+            
+            // Logica per adattare vecchi backup (boolean) al nuovo sistema (Date)
+            let dataVisto = null;
+            if (f.visto === true || f.visto === 1) dataVisto = new Date();
+            else if (typeof f.visto === 'string' && f.visto) dataVisto = f.visto; // Se è già una data in formato testuale
+
             await db.promise().query(
-                "INSERT INTO film (testo, copertina, visto, rating, utente_id, lista_id) VALUES (?, ?, ?, ?, ?, ?)",
-                [f.testo, f.copertina || null, f.visto || false, f.rating || 0, req.utente.id, lista_id]
+                "INSERT INTO film (testo, copertina, visto, rating, durata, genere, utente_id, lista_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [f.testo, f.copertina || null, dataVisto, f.rating || 0, f.durata || 0, f.genere || 'Non specificato', req.utente.id, lista_id]
             );
         }
 
-        // Se tutto è andato bene, conferma i cambiamenti!
         await db.promise().commit();
         res.json({ message: "Importazione completata!" });
     } catch (err) {
-        // In caso di errore, rollback annulla tutte le modifiche fatte finora!
         await db.promise().rollback();
         console.error(err);
         res.status(500).json({ error: "Errore durante l'importazione." });
