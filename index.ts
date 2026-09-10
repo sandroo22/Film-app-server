@@ -13,7 +13,10 @@ export interface CustomRequest extends Request {
 
 const app = express();
 const PORT = 5000;
-const JWT_SECRET = "Catania10!"; 
+
+// NUOVE CHIAVI SEGRETE PER I TOKEN (meglio se in futuro le metti in un file .env)
+const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET || "Catania10_Access_Secret_Key!"; 
+const REFRESH_TOKEN_SECRET = process.env.REFRESH_TOKEN_SECRET || "Catania10_Refresh_Super_Secret_Key!"; 
 
 app.use(cors());
 app.use(express.json());
@@ -35,29 +38,34 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage: storage });
 
-const db = mysql.createConnection({
+const db = mysql.createPool({
     host: process.env.DB_HOST || 'localhost',
     user: 'root',     
-    password: ''     
+    password: '',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
 });
 
 // Connessione con auto-creazione tabelle
-db.connect((err) => {
+db.getConnection((err, connection) => {
     if (err) {
         console.error("Errore di connessione a MySQL:", err);
         return;
     }
     console.log("Connesso al server MySQL!");
 
-    db.query("CREATE DATABASE IF NOT EXISTS film_db", (err) => {
+    connection.query("CREATE DATABASE IF NOT EXISTS film_db", (err) => {
         if (err) throw err;
-        db.query("USE film_db", (err) => {
+        connection.query("USE film_db", (err) => {
             if (err) throw err;
             
+            // AGGIORNATA: aggiunta colonna refresh_token
             const queryUtenti = `CREATE TABLE IF NOT EXISTS utenti (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 email VARCHAR(255) UNIQUE NOT NULL,
-                password VARCHAR(255) NOT NULL
+                password VARCHAR(255) NOT NULL,
+                refresh_token VARCHAR(512) DEFAULT NULL
             )`;
             
             const queryListe = `CREATE TABLE IF NOT EXISTS liste (
@@ -68,7 +76,6 @@ db.connect((err) => {
                 FOREIGN KEY (utente_id) REFERENCES utenti(id) ON DELETE CASCADE
             )`;
             
-            // visto è ora un DATETIME
             const queryFilm = `CREATE TABLE IF NOT EXISTS film (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 testo VARCHAR(255) NOT NULL,
@@ -105,13 +112,19 @@ db.connect((err) => {
                 FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
             )`;
 
-            db.query(queryUtenti, () => {
-                db.query(queryListe, () => {
-                    db.query(queryFilm, () => {
-                        db.query(queryAttori, () => {
-                            db.query(queryTags, () => {
-                                db.query(queryFilmTags, () => {
+            connection.query(queryUtenti, () => {
+                // Aggiornamento automatico: se la tabella utenti esisteva già, aggiungiamo la colonna refresh_token
+                connection.query("ALTER TABLE utenti ADD COLUMN refresh_token VARCHAR(512) DEFAULT NULL", (err) => {
+                    // Ignoriamo l'errore se la colonna esiste già (ER_DUP_FIELDNAME)
+                });
+
+                connection.query(queryListe, () => {
+                    connection.query(queryFilm, () => {
+                        connection.query(queryAttori, () => {
+                            connection.query(queryTags, () => {
+                                connection.query(queryFilmTags, () => {
                                     console.log("Tabelle verificate/create con successo!");
+                                    connection.release();
                                 });
                             });
                         });
@@ -128,14 +141,17 @@ const autenticaToken = (req: CustomRequest, res: Response, next: NextFunction): 
 
     if (!token) return res.status(401).json({ errore: "Accesso negato, token mancante" });
 
-    jwt.verify(token, JWT_SECRET, (err, utenteDecodificato) => {
+    // Usa la nuova ACCESS_TOKEN_SECRET
+    jwt.verify(token, ACCESS_TOKEN_SECRET, (err, utenteDecodificato) => {
         if (err) return res.status(403).json({ errore: "Token non valido o scaduto" });
         req.utente = utenteDecodificato; 
         next();
     });
 };
 
-//  ROTTE UTENTI 
+// ==========================
+// ROTTE UTENTI & AUTH
+// ==========================
 app.post('/api/register', async (req: Request, res: Response): Promise<any> => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ errore: "Campi incompleti" });
@@ -183,15 +199,67 @@ app.post('/api/login', (req: Request, res: Response) => {
             }
             await db.promise().query("UPDATE film SET lista_id = ? WHERE utente_id = ? AND lista_id IS NULL", [defaultListId, utenteUtile.id]);
 
-            const token = jwt.sign({ id: utenteUtile.id, email: utenteUtile.email }, JWT_SECRET, { expiresIn: '365d' });
-            return res.json({ token });
+            // GENERAZIONE DEI DUE TOKEN
+            const accessToken = jwt.sign({ id: utenteUtile.id, email: utenteUtile.email }, ACCESS_TOKEN_SECRET, { expiresIn: '15m' }); // Scade in 15 minuti
+            const refreshToken = jwt.sign({ id: utenteUtile.id }, REFRESH_TOKEN_SECRET, { expiresIn: '30d' }); // Scade in 30 giorni
+
+            // Salva il refreshToken nel database
+            await db.promise().query("UPDATE utenti SET refresh_token = ? WHERE id = ?", [refreshToken, utenteUtile.id]);
+
+            // Restituisce entrambi i token al frontend
+            return res.json({ 
+                token: accessToken, 
+                refreshToken: refreshToken 
+            });
         } catch (erroreProcesso) {
+            console.error("ERRORE DURANTE IL LOGIN:", erroreProcesso);
             return res.status(500).json({ errore: "Errore interno del server" });
         }
     });
 });
 
-// ROTTE LISTE 
+// NUOVA ROTTA: Rinnova il token di accesso usando il refresh token
+app.post('/api/refresh', async (req: Request, res: Response): Promise<any> => {
+    const { refreshToken } = req.body;
+    
+    if (!refreshToken) return res.status(401).json({ errore: "Refresh Token mancante" });
+
+    try {
+        // Cerca l'utente che possiede questo refresh token nel database
+        const [users]: any = await db.promise().query("SELECT * FROM utenti WHERE refresh_token = ?", [refreshToken]);
+        if (users.length === 0) return res.status(403).json({ errore: "Refresh Token non valido o revocato" });
+
+        const utenteUtile = users[0];
+
+        // Verifica che il refresh token sia valido e non scaduto
+        jwt.verify(refreshToken, REFRESH_TOKEN_SECRET, (err: any, decoded: any) => {
+            if (err) return res.status(403).json({ errore: "Refresh Token scaduto. Effettua di nuovo il login." });
+
+            // Genera un nuovo Access Token fresco di 15 minuti
+            const newAccessToken = jwt.sign({ id: utenteUtile.id, email: utenteUtile.email }, ACCESS_TOKEN_SECRET, { expiresIn: '15m' });
+            
+            res.json({ token: newAccessToken });
+        });
+    } catch (error) {
+        res.status(500).json({ errore: "Errore del server durante il refresh" });
+    }
+});
+
+// NUOVA ROTTA: Logout (Invalida il refresh token)
+app.post('/api/logout', autenticaToken, async (req: CustomRequest, res: Response): Promise<any> => {
+    try {
+        // Rimuove il refresh token dal database, così non potrà più essere usato per generare access token
+        await db.promise().query("UPDATE utenti SET refresh_token = NULL WHERE id = ?", [req.utente.id]);
+        res.json({ message: "Logout effettuato con successo" });
+    } catch (error) {
+        res.status(500).json({ errore: "Errore durante il logout" });
+    }
+});
+
+// ==========================
+// RESTO DELLE ROTTE INVARIATE
+// ==========================
+
 app.get('/api/liste', autenticaToken, (req: CustomRequest, res: Response) => {
     db.query("SELECT * FROM liste WHERE utente_id = ?", [req.utente.id], (err, results) => {
         if (err) return res.status(500).json({ errore: err.message });
@@ -241,7 +309,6 @@ app.delete('/api/liste/:id', autenticaToken, async (req: CustomRequest, res: Res
     }
 });
 
-// ROTTE FILM 
 app.get('/api/film', autenticaToken, (req: CustomRequest, res: Response) => {
     db.query("SELECT * FROM film WHERE utente_id = ?", [req.utente.id], (err, results) => {
         if (err) return res.status(500).json({ errore: err.message });
@@ -304,10 +371,9 @@ app.put('/api/film/:id', autenticaToken, (req: CustomRequest, res: Response) => 
     });
 });
 
-//  Salvataggio Data (NOW()) o NULL
 app.patch('/api/film/:id/visto', autenticaToken, (req: CustomRequest, res: Response) => {
     const idDaModificare = req.params.id;
-    const setVisto = req.body.visto; // Il frontend invierà true o false
+    const setVisto = req.body.visto; 
     
     const query = setVisto 
         ? "UPDATE film SET visto = NOW() WHERE id = ? AND utente_id = ?" 
@@ -345,8 +411,6 @@ app.delete('/api/film/:id', autenticaToken, (req: CustomRequest, res: Response) 
     });
 });
 
-
-//  ROTTE ATTORI 
 app.get('/api/film/:filmId/attori', autenticaToken, (req: CustomRequest, res: Response): any => {
     const filmId = req.params.filmId;
     db.query("SELECT * FROM film WHERE id = ? AND utente_id = ?", [filmId, req.utente.id], (err, results: any) => {
@@ -372,8 +436,6 @@ app.post('/api/film/:filmId/attori', autenticaToken, (req: CustomRequest, res: R
     });
 });
 
-
-// ROTTE TAG 
 app.get('/api/film/:id/tags', autenticaToken, async (req: CustomRequest, res: Response): Promise<any> => {
     const filmId = req.params.id;
     try {
@@ -446,13 +508,10 @@ app.delete('/api/film/:filmId/tags/:tagId', autenticaToken, async (req: CustomRe
     }
 });
 
-
-//  ROTTA STATISTICHE 
 app.get('/api/statistiche', autenticaToken, async (req: CustomRequest, res: Response) => {
     const utenteId = req.utente.id;
 
     try {
-        // Calcola i totali base (ora controlliamo IS NOT NULL per la data)
         const [statsBase]: any = await db.promise().query(`
             SELECT 
                 COUNT(*) AS totale_film,
@@ -463,7 +522,6 @@ app.get('/api/statistiche', autenticaToken, async (req: CustomRequest, res: Resp
             WHERE utente_id = ?
         `, [utenteId]);
 
-        // Calcola i minuti per genere
         const [statsGeneri]: any = await db.promise().query(`
             SELECT 
                 genere, 
@@ -474,12 +532,10 @@ app.get('/api/statistiche', autenticaToken, async (req: CustomRequest, res: Resp
             ORDER BY minuti_visti DESC
         `, [utenteId]);
 
-        // Conta le liste create dall'utente
         const [statsListe]: any = await db.promise().query(`
             SELECT COUNT(*) AS totale_liste FROM liste WHERE utente_id = ?
         `, [utenteId]);
 
-        //  Prendi gli ultimi 3 film visti (ordinati per data decrescente)
         const [ultimiVisti]: any = await db.promise().query(`
             SELECT id, testo, copertina, visto, durata, genere, rating
             FROM film 
@@ -502,8 +558,6 @@ app.get('/api/statistiche', autenticaToken, async (req: CustomRequest, res: Resp
     }
 });
 
-
-//  EXPORT/IMPORT JSON 
 app.get('/api/export', autenticaToken, async (req: CustomRequest, res: Response) => {
     try {
         const [liste] = await db.promise().query("SELECT nome, is_default FROM liste WHERE utente_id = ?", [req.utente.id]);
@@ -547,10 +601,9 @@ app.post('/api/import', autenticaToken, async (req: CustomRequest, res: Response
         for (const f of film) {
             const lista_id = mappaListe[f.lista_nome] || defaultListId;
             
-            // Logica per adattare vecchi backup (boolean) al nuovo sistema (Date)
             let dataVisto = null;
             if (f.visto === true || f.visto === 1) dataVisto = new Date();
-            else if (typeof f.visto === 'string' && f.visto) dataVisto = f.visto; // Se è già una data in formato testuale
+            else if (typeof f.visto === 'string' && f.visto) dataVisto = f.visto; 
 
             await db.promise().query(
                 "INSERT INTO film (testo, copertina, visto, rating, durata, genere, utente_id, lista_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
